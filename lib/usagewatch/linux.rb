@@ -1,313 +1,169 @@
 # License: (MIT), Copyright (C) 2013 usagewatch Author Phil Chen, contributor Ruben Espinosa
 
 module Usagewatch
-  # Show the amount of total disk used in Gigabytes
-  def self.uw_diskused
-    @df = `df`
-    @parts = @df.split(" ").map { |s| s.to_i }
-    @sum = 0
-    for i in (9..@parts.size - 1).step(6) do
-      @sum += @parts[i]
-    end
-    @round = @sum.round(2)
-    @totaldiskused = ((@round/1024)/1024).round(2)
-  end
+  class Linux
+    attr_accessor :ipv4_data, :ipv6_data, :meminfo_data, :net_dev_data, :disk_io_data
 
-  # Show the percentage of disk used.
-  def self.uw_diskused_perc
-    df = `df --total`
-    df.split(" ").last.to_f.round(2)
-  end
-
-  # Show the percentage of CPU used
-  def self.uw_cpuused
-    @proc0 = File.readlines('/proc/stat').grep(/^cpu /).first.split(" ")
-    sleep 1
-    @proc1 = File.readlines('/proc/stat').grep(/^cpu /).first.split(" ")
-
-    @proc0usagesum = @proc0[1].to_i + @proc0[2].to_i + @proc0[3].to_i
-    @proc1usagesum = @proc1[1].to_i + @proc1[2].to_i + @proc1[3].to_i
-    @procusage = @proc1usagesum - @proc0usagesum
-
-    @proc0total = 0
-    for i in (1..4) do
-      @proc0total += @proc0[i].to_i
-    end
-    @proc1total = 0
-    for i in (1..4) do
-      @proc1total += @proc1[i].to_i
-    end
-    @proctotal = (@proc1total - @proc0total)
-
-    @cpuusage = (@procusage.to_f / @proctotal.to_f)
-    @cpuusagepercentage = (100 * @cpuusage).to_f.round(2)
-  end
-
-  # return hash of top ten proccesses by cpu consumption
-  # example [["apache2", 12.0], ["passenger", 13.2]]
-  def self.uw_cputop
-    ps = `ps aux | awk '{print $11, $3}' | sort -k2nr  | head -n 10`
-    array = []
-    ps.each_line do |line|
-      line = line.chomp.split(" ")
-      array << [line.first.gsub(/[\[\]]/, ""), line.last]
-    end
-    array
-  end
-
-  # Show the number of TCP connections used
-  def self.uw_tcpused
-    if File.exists?("/proc/net/sockstat")
-      File.open("/proc/net/sockstat", "r") do |ipv4|
-        @sockstat = ipv4.read
-      end
-
-      @tcp4data = @sockstat.split
-      @tcp4count = @tcp4data[5]
+    def initialize
+      @ipv4_data = ip_data '/proc/net/sockstat'
+      @ipv6_data = ip_data '/proc/net/sockstat6'
+      @meminfo_data = meminfo
+      @net_dev_data = net_dev
+      @disk_io_data = disk_io_parse
     end
 
-    if  File.exists?("/proc/net/sockstat6")
-      File.open("/proc/net/sockstat6", "r") do |ipv6|
-        @sockstat6 = ipv6.read
-
-      end
-
-      @tcp6data = @sockstat6.split
-      @tcp6count = @tcp6data[2]
+    def refresh
+      initialize
     end
 
-    @totaltcpused = @tcp4count.to_i + @tcp6count.to_i
-  end
-
-  # Show the number of UDP connections used
-  def self.uw_udpused
-    if File.exists?("/proc/net/sockstat")
-      File.open("/proc/net/sockstat", "r") do |ipv4|
-        @sockstat = ipv4.read
-      end
-
-      @udp4data = @sockstat.split
-      @udp4count = @udp4data[16]
+    def meminfo
+      `sed 's/\(.*\): *\(\d*\)/\1 \2/g' < /proc/meminfo | sed 's/kB//g'`
+        .each_line.each_with_object({}) { |l,h|
+          data = l.split
+          h[data[0]] = data[1].to_f
+        }
     end
 
-    if File.exists?("/proc/net/sockstat6")
-      File.open("/proc/net/sockstat6", "r") do |ipv6|
-        @sockstat6 = ipv6.read
-      end
-
-      @udp6data = @sockstat6.split
-      @udp6count = @udp6data[5]
+    def df
+      `df`.split(' ').map(&:to_f)
     end
 
-    @totaludpused = @udp4count.to_i + @udp6count.to_i
-  end
-
-  # Show the percentage of Active Memory used
-  def self.uw_memused
-    if File.exists?("/proc/meminfo")
-      File.open("/proc/meminfo", "r") do |file|
-        @result = file.read
-      end
+    def df_total
+      `df --total`.split(" ").map(&:to_f)
     end
 
-    @memstat = @result.split("\n").collect{|x| x.strip}
-    @memtotal = @memstat[0].gsub(/[^0-9]/, "")
-    @memactive = @memstat[5].gsub(/[^0-9]/, "")
-    @memactivecalc = (@memactive.to_f * 100) / @memtotal.to_f
-    @memusagepercentage = @memactivecalc.round
-  end
-
-  # return hash of top ten proccesses by mem consumption
-  # example [["apache2", 12.0], ["passenger", 13.2]]
-  def self.uw_memtop
-    ps = `ps aux | awk '{print $11, $4}' | sort -k2nr  | head -n 10`
-    array = []
-    ps.each_line do |line|
-      line = line.chomp.split(" ")
-      array << [line.first.gsub(/[\[\]]/, ""), line.last]
-    end
-    array
-  end
-
-  # Show the average system load of the past minute
-  def self.uw_load
-    if File.exists?("/proc/loadavg")
-      File.open("/proc/loadavg", "r") do |file|
-        @loaddata = file.read
-      end
-
-      @load = @loaddata.split(/ /).first.to_f
-    end
-  end
-
-  # Bandwidth Received Method
-  def self.bandrx
-
-    if File.exists?("/proc/net/dev")
-      File.open("/proc/net/dev", "r") do |file|
-        @result = file.read
-      end
+    # Need to find out about the odd indexing here.
+    def disk_used
+      parts = df
+      sum = (9..parts.size - 1).step(6).reduce(0) { |t, i| t += parts[i] }.round(2) 
+      ((sum/1024)/1024).round(2)
     end
 
-    @arrRows = @result.split("\n")
-
-    @arrEthLoRows = @arrRows.grep(/eth|lo/)
-
-    rowcount = (@arrEthLoRows.count - 1)
-
-    for i in (0..rowcount)
-      @arrEthLoRows[i] = @arrEthLoRows[i].gsub(/\s+/m, ' ').strip.split(" ")
+    # Show the percentage of disk used.
+    def disk_used_percentage
+      df_total[-1].round(2)
     end
 
-    @arrColumns = Array.new
-    for l in (0..rowcount)
-      @temp = Array.new
-      @temp[0] = @arrEthLoRows[l][1]
-      @temp[1] = @arrEthLoRows[l][9]
-      @arrColumns << @temp
+    def cpu_data
+      File.readlines('/proc/stat').grep(/^cpu /).first.split.map(&:to_i)
     end
 
-    columncount = (@arrColumns[0].count - 1)
-
-    @arrTotal = Array.new
-    for p in (0..columncount)
-      @arrTotal[p] = 0
+    def cpu_used(proc)
+      used = (1..3).reduce(0) { |t, i| t += proc[i] }.to_f
+      percent (used / (used + proc[4]))
     end
 
-    for j in (0..columncount)
-      for k in (0..rowcount)
-        @arrTotal[j] = @arrColumns[k][j].to_i + @arrTotal[j]
-      end
+    def percent(num)
+      (num.to_f * 100).round(2)
     end
 
-    @bandrxtx = @arrTotal
-  end
-
-  # Current Bandwidth Received Calculation in Mbit/s
-  def self.uw_bandrx
-
-    @new0 = self.bandrx
-    sleep 1
-    @new1 = self.bandrx
-
-    @bytesreceived = @new1[0].to_i - @new0[0].to_i
-    @bitsreceived = (@bytesreceived * 8)
-    @megabitsreceived = (@bitsreceived.to_f / 1024 / 1024).round(3)
-  end
-
-  # Bandwidth Transmitted Method
-  def self.bandtx
-
-    if File.exists?("/proc/net/dev")
-      File.open("/proc/net/dev", "r") do |file|
-        @result = file.read
-      end
+    def process_list(n,s='cpu')
+      sort = s.eql? 'cpu' ? 2 : 3
+      `ps aux | awk '{print $11, $3, $4}' | sort -k#{sort}nr  | head -n #{n} | sed 's/\[\(.*\)\]/\1/' | sed 's/.*\///'`
+        .each_line.each_with_object({}){ |l, h|
+          data = l.sub(':','').split
+          h[data[0]] = { 'cpu' => percent(data[1]), 'ram' => percent(data[2]) }
+        }
     end
 
-    @arrRows = @result.split("\n")
-
-    @arrEthLoRows = @arrRows.grep(/eth|lo/)
-
-    rowcount = (@arrEthLoRows.count - 1)
-
-    for i in (0..rowcount)
-      @arrEthLoRows[i] = @arrEthLoRows[i].gsub(/\s+/m, ' ').strip.split(" ")
+    # return hash of top ten proccesses by cpu consumption
+    def top_cpu_processes(n=10)
+      process_list(n, 'cpu')
     end
 
-    @arrColumns = Array.new
-    for l in (0..rowcount)
-      @temp = Array.new
-      @temp[0] = @arrEthLoRows[l][1]
-      @temp[1] = @arrEthLoRows[l][9]
-      @arrColumns << @temp
+    def ip_data(file)
+      File.open(file, 'r').each_line.each_with_object({}) { |l,h|
+        data = l.split
+        h[data[0].sub(':','')] = data[2].to_f
+      }
     end
 
-    columncount = (@arrColumns[0].count - 1)
-
-    @arrTotal = Array.new
-    for p in (0..columncount)
-      @arrTotal[p] = 0
+    # Show the number of TCP connections used
+    def tcp_connections
+      @ipv4_data['TCP'] + @ipv6_data['TCP6']
     end
 
-    for j in (0..columncount)
-      for k in (0..rowcount)
-        @arrTotal[j] = @arrColumns[k][j].to_i + @arrTotal[j]
-      end
+    # Show the number of UDP connections used
+    def udp_connections
+      @ipv4_data['UDP'] + @ipv6_data['UDP6']
     end
 
-    @bandrxtx = @arrTotal
-  end
-
-  # Current Bandwidth Transmitted in Mbit/s
-  def self.uw_bandtx
-
-    @new0 = self.bandtx
-    sleep 1
-    @new1 = self.bandtx
-
-    @bytestransmitted = @new1[1].to_i - @new0[1].to_i
-    @bitstransmitted = (@bytestransmitted * 8)
-    @megabitstransmitted = (@bitstransmitted.to_f / 1024 / 1024).round(3)
-  end
-
-  # Disk Usage Method
-  def self.diskio
-
-    if File.exists?("/proc/diskstats")
-      File.open("/proc/diskstats", "r") do |file|
-        @result = file.read
-      end
+    # Show the percentage of Active Memory used
+    def memory_used
+      (@meminfo_data['Active'] / @meminfo_data['MemTotal']).round(2)
     end
 
-    @arrRows = @result.split("\n")
-
-    rowcount = (@arrRows.count - 1)
-
-    for i in (0..rowcount)
-      @arrRows[i] = @arrRows[i].gsub(/\s+/m, ' ').strip.split(" ")
+    # return hash of top ten proccesses by mem consumption
+    def top_processes(n)
+      process_list(n, 'mem')
     end
 
-    @arrColumns = Array.new
-    for l in (0..rowcount)
-      @temp = Array.new
-      @temp[0] = @arrRows[l][3]
-      @temp[1] = @arrRows[l][7]
-      @arrColumns << @temp
+    # Show the average system load of the past minute
+    def uw_load
+      percent File.open("/proc/loadavg", 'r')[1].split[1].to_f
     end
 
-    columncount = (@arrColumns[0].count - 1)
-
-    @arrTotal = Array.new
-    for p in (0..columncount)
-      @arrTotal[p] = 0
+    def device_tags
+      %w(wlan eth em)
     end
 
-    for j in (0..columncount)
-      for k in (0..rowcount)
-        @arrTotal[j] = @arrColumns[k][j].to_i + @arrTotal[j]
-      end
+    def net_hash(data)
+      {
+        'rxbytes'   => data[1].to_f,
+        'rxpackets' => data[2].to_f,
+        'txbytes'   => data[9].to_f,
+        'txpackets' => data[10].to_f
+      }
     end
 
-    @diskiorw= @arrTotal
-  end
+    def net_dev
+      File.open("/proc/net/dev", "r").select{ |l| l =~ /^ +.+: +\d/ }
+        .map{ |l| l.chomp.squeeze.lstrip.sub(':','').split }
+        .each_with_object({}) { |d,h|
+          h[d[0]] = net_hash(d)
+        }
+    end
 
-  # Current Disk Reads Completed
-  def self.uw_diskioreads
+    # Bandwidth Received Method KB
+    def bandwidth_rx(dev='eth0')
+      @net_dev_data[dev]['rxbytes']/1024
+    end
 
-    @new0 = self.diskio
-    sleep 1
-    @new1 = self.diskio
+    # Bandwidth Transmitted Method KB
+    def bandwidth_tx(dev='eth0')
+      @net_dev_data[dev]['txbytes']/1024
+    end
 
-    @diskreads = @new1[0].to_i - @new0[0].to_i
-  end
+    def disk_io_hash(data)
+      {
+        'reads_issued'    => data[3].to_i,
+        'reads_merged'    => data[4].to_i,
+        'sectors_read'    => data[5].to_i,
+        'ms_reading'      => data[6].to_i,
+        'writes_complete' => data[7].to_i,
+        'writes_merged'   => data[8].to_i,
+        'sectors_written' => data[9].to_i,
+        'ms_writing'      => data[10].to_i,
+        'current_io'      => data[11].to_i,
+        'ms_io'           => data[12].to_i,
+        'ms_weighted_io'  => data[13].to_i
+      }
+    end
 
-  # Current Disk Writes Completed
-  def self.uw_diskiowrites
+    def disk_io_parse
+      File.open("/proc/diskstats", "r")
+        .map{ |l| l.lstrip.chomp.squeeze.split }
+        .each_with_object({}){ |d,h|
+          h[d[2]] = disk_io_hash(d)
+      }
+    end
 
-    @new0 = self.diskio
-    sleep 1
-    @new1 = self.diskio
+    def disk_reads
+      @disk_io_data[dev]['reads_issued']
+    end
 
-    @diskwrites = @new1[1].to_i - @new0[1].to_i
+    def disk_writes
+      @disk_io_data[dev]['writes_completed']
+    end
   end
 end
